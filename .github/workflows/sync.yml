@@ -105,9 +105,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="deps-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          gh release create "$tag" --draft --target "$GITHUB_SHA" --title "Dependency snapshot $tag" --notes 'Latest dependency ZIPs for Windows x64 and macOS arm64. See version.json for per-tool versions and SHA-256 checksums.'
+          release_id=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" -f name="Dependency snapshot $tag" -f body='Latest dependency ZIPs for Windows x64 and macOS arm64. See version.json for per-tool versions and SHA-256 checksums.' -F draft=true --jq '.id')
           gh release upload "$tag" dist/*.zip dist/version.json
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" > uploaded-release.json
+          gh api "repos/${GITHUB_REPOSITORY}/releases/$release_id" > uploaded-release.json
           python - <<'PY'
           import json
           from pathlib import Path
@@ -118,5 +118,5 @@ jobs:
           if actual != expected:
               raise SystemExit('Release upload is incomplete; leaving it as a draft.')
           PY
-          gh release edit "$tag" --draft=false --latest
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/$release_id" -F draft=false -f make_latest=true > /dev/null
           echo "Published complete snapshot: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"

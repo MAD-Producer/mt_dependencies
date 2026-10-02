@@ -29,6 +29,7 @@ Manual `force` rebuilds available packages; normally unchanged ZIPs are reused b
 4. `publish` merges both artifacts, checks declared files, sizes and SHA-256, and generates the complete manifest.
 5. Create a **new draft**, upload all eleven assets, confirm uploaded names/sizes, then publish and explicitly mark it latest.
 
+Drafts are queried and published by their Release ID; querying by tag before publication may return 404 because the tag is not created yet.
 Failures do not replace the current public Release. Failed drafts may remain for diagnosis; historical public Releases are not automatically deleted.
 The concurrency group does not cancel a running publication. Only the publish job receives `contents: write`; other jobs are read-only.
 Actions use the built-in `GITHUB_TOKEN`; do not add a PAT or OpenList administrator credentials.
