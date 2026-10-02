@@ -1,0 +1,122 @@
+name: Sync dependency releases
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/sync.yml
+      - scripts/**
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild all packages even if upstream versions are unchanged
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-release-sync
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.plan.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+      - name: Resolve upstream versions and previous packages
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FORCE_BUILD: ${{ inputs.force }}
+        run: |
+          args=()
+          if [[ "$FORCE_BUILD" == "true" ]]; then args+=(--force); fi
+          python scripts/sync.py plan --out plan.json "${args[@]}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: steps.plan.outputs.changed == 'true'
+        with:
+          name: sync-plan
+          path: plan.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Record no-change result
+        if: steps.plan.outputs.changed != 'true'
+        run: echo 'No dependency changes; the current Release is unchanged.' >> "$GITHUB_STEP_SUMMARY"
+
+  package:
+    needs: resolve
+    if: needs.resolve.outputs.changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-latest
+          - platform: macos-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: sync-plan
+      - name: Build changed packages and reuse unchanged ZIPs
+        shell: bash
+        run: python scripts/sync.py build --platform "${{ matrix.platform }}" --plan plan.json --out dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: packages-${{ matrix.platform }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve, package]
+    if: needs.resolve.outputs.changed == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: packages-*
+          path: dist
+          merge-multiple: true
+      - name: Assemble the complete dependency manifest
+        run: python scripts/sync.py manifest --directory dist
+      - name: Publish only after all assets are uploaded
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="deps-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" --draft --target "$GITHUB_SHA" --title "Dependency snapshot $tag" --notes 'Latest dependency ZIPs for Windows x64 and macOS arm64. See version.json for per-tool versions and SHA-256 checksums.'
+          gh release upload "$tag" dist/*.zip dist/version.json
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" > uploaded-release.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          uploaded = json.loads(Path('uploaded-release.json').read_text())
+          expected = {path.name: path.stat().st_size for path in Path('dist').glob('*.zip')}
+          expected['version.json'] = Path('dist/version.json').stat().st_size
+          actual = {asset['name']: asset['size'] for asset in uploaded['assets']}
+          if actual != expected:
+              raise SystemExit('Release upload is incomplete; leaving it as a draft.')
+          PY
+          gh release edit "$tag" --draft=false --latest
+          echo "Published complete snapshot: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
