@@ -29,11 +29,6 @@ API_HEADERS = {
 PLATFORMS = ("windows-x64", "macos-arm64")
 TOOLS = ("deno", "mediainfo", "ffmpeg", "bbdown", "yt-dlp", "aria2")
 PACKAGING_REVISION = 1
-# 公共 BT tracker 列表随每日同步进 Release（aria2 页的镜像通道数据源）
-TRACKER_LISTS = {
-    "xiu2": "https://raw.githubusercontent.com/XIU2/TrackersListCollection/master/best.txt",
-    "ngosang": "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
-}
 
 
 def get(url: str, *, github: bool = False) -> bytes:
@@ -665,55 +660,6 @@ def write_json(path: Path, content: dict) -> None:
     )
 
 
-def announce_lines(text: str) -> list[str]:
-    """Count lines that look like announce URLs (the schemes aria2 accepts)."""
-    prefixes = ("udp://", "http://", "https://", "ws://", "wss://")
-    return [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and line.strip().lower().startswith(prefixes)
-    ]
-
-
-def resolve_trackers(old_manifest: dict, assets: dict) -> tuple[dict, bool]:
-    """Merge public tracker sources, retaining the previous list on total failure."""
-    previous = old_manifest.get("trackers", {}).get("merged")
-    entries = set()
-    for name, url in TRACKER_LISTS.items():
-        try:
-            lines = announce_lines(get_text(url))
-            if len(lines) < 5:
-                raise RuntimeError(
-                    f"suspicious tracker list: only {len(lines)} announce URLs"
-                )
-            entries.update(lines)
-        except RuntimeError as error:
-            print(f"::warning::trackers/{name}: {error}")
-    if entries:
-        content = "\n".join(sorted(entries)) + "\n"
-        body = content.encode("utf-8")
-        entry = {
-            "version": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "fileName": "trackers-merged.txt",
-            "sha256": hashlib.sha256(body).hexdigest(),
-            "size": len(body),
-            "content": content,
-        }
-    else:
-        previous_asset = assets.get(previous.get("fileName", "")) if previous else None
-        if not previous_asset:
-            raise RuntimeError(
-                "all tracker sources failed and no previous merged list is available"
-            )
-        entry = {
-            key: previous[key] for key in ("version", "fileName", "sha256", "size")
-        }
-        entry["previousUrl"] = previous_asset["browser_download_url"]
-    changed = previous is None or previous.get("sha256") != entry["sha256"]
-    print(f"trackers/merged: {'update' if changed else 'reuse'} {entry['version']}")
-    return {"merged": entry}, changed
-
-
 def create_plan(repository: str, output: Path, force: bool) -> dict:
     try:
         previous = release(repository)
@@ -734,7 +680,7 @@ def create_plan(repository: str, output: Path, force: bool) -> dict:
     )
     releases = {}
     platforms = {}
-    changed = bool(old_manifest.get("aria2"))
+    changed = bool(old_manifest.get("aria2") or old_manifest.get("trackers"))
     for platform in PLATFORMS:
         packages = {}
         for tool in TOOLS:
@@ -768,13 +714,10 @@ def create_plan(repository: str, output: Path, force: bool) -> dict:
                 f"{platform}/{tool}: {'build' if needs_build else 'reuse'} {upstream['version']}"
             )
         platforms[platform] = packages
-    trackers, trackers_changed = resolve_trackers(old_manifest, assets)
-    changed = changed or trackers_changed
     plan = {
         "changed": changed,
         "repository": repository,
         "platforms": platforms,
-        "trackers": trackers,
     }
     write_json(output, plan)
     if os.environ.get("GITHUB_OUTPUT"):
@@ -879,31 +822,10 @@ def assemble_manifest(directory: Path, plan: dict) -> dict:
         raise RuntimeError(
             "release directory does not contain exactly the current twelve ZIPs"
         )
-    trackers = {}
-    for name, item in plan.get("trackers", {}).items():
-        filename = item["fileName"]
-        if Path(filename).name != filename or not filename.startswith("trackers-"):
-            raise RuntimeError(f"invalid tracker filename: {filename}")
-        path = directory / filename
-        if "content" in item:
-            path.write_text(item["content"], encoding="utf-8", newline="\n")
-        else:
-            download(item["previousUrl"], path, item["sha256"])
-        if path.stat().st_size != item["size"] or sha256(path) != item["sha256"]:
-            raise RuntimeError(f"invalid final tracker list: {filename}")
-        trackers[name] = {
-            "version": item["version"],
-            "fileName": path.name,
-            "sha256": item["sha256"],
-            "size": item["size"],
-        }
-    if set(trackers) != {"merged"}:
-        raise RuntimeError("incomplete tracker list set in the sync plan")
     manifest = {
         "schemaVersion": 1,
         "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "platforms": platforms,
-        "trackers": trackers,
     }
     write_json(directory / "version.json", manifest)
     return manifest
