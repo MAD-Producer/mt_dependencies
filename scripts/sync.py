@@ -370,6 +370,7 @@ def build_aria2_macos(work: Path, out: Path, upstream: dict) -> dict:
             "--without-libxml2",
             "--without-libssh2",
             "--without-sqlite3",
+            "--without-libcares",
         ],
         cwd=build,
         check=True,
