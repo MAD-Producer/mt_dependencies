@@ -355,7 +355,7 @@ def build_aria2_macos(work: Path, out: Path, upstream: dict) -> dict:
     extracted.mkdir()
     with tarfile.open(downloaded) as archive:
         archive.extractall(extracted, filter="data")
-    configure = [path for path in extracted.rglob("configure") if path.is_file()]
+    configure = [path for path in extracted.glob("*/configure") if path.is_file()]
     if len(configure) != 1:
         raise RuntimeError("official aria2 source tree not found in the tarball")
     source_root = configure[0].parent
