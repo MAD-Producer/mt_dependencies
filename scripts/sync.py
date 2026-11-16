@@ -676,50 +676,42 @@ def announce_lines(text: str) -> list[str]:
 
 
 def resolve_trackers(old_manifest: dict, assets: dict) -> tuple[dict, bool]:
-    """Fetch the public tracker lists so each Release ships fresh mirror copies.
-
-    Mirrors the tools' resilience pattern: on upstream failure keep the previous
-    Release's list (downloaded again at manifest stage); changed digests flip the
-    global ``changed`` flag so tracker-only updates still trigger a Release.
-    """
-    old = old_manifest.get("trackers", {})
-    trackers: dict = {}
-    changed = False
+    """Merge public tracker sources, retaining the previous list on total failure."""
+    previous = old_manifest.get("trackers", {}).get("merged")
+    entries = set()
     for name, url in TRACKER_LISTS.items():
-        previous = old.get(name)
         try:
-            content = get_text(url)
-            entries = announce_lines(content)
-            if len(entries) < 5:
-                # 语义校验：非 announce 内容（如误吐的 HTML 错误页）走 previous 保留路径，
-                # SHA-256 只能证明传输完整，证明不了内容正确
+            lines = announce_lines(get_text(url))
+            if len(lines) < 5:
                 raise RuntimeError(
-                    f"suspicious tracker list: only {len(entries)} announce URLs"
+                    f"suspicious tracker list: only {len(lines)} announce URLs"
                 )
-            body = content.encode("utf-8")
-            entry = {
-                "version": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                "fileName": f"trackers-{name}.txt",
-                "sha256": hashlib.sha256(body).hexdigest(),
-                "size": len(body),
-                "content": content,
-            }
+            entries.update(lines)
         except RuntimeError as error:
-            if not previous:
-                raise
-            previous_asset = assets.get(previous.get("fileName", ""))
-            if not previous_asset:
-                raise
-            print(f"::warning::trackers/{name}: {error}; preserving the previous list")
-            entry = {
-                key: previous[key] for key in ("version", "fileName", "sha256", "size")
-            }
-            entry["previousUrl"] = previous_asset["browser_download_url"]
-        updated = previous is None or previous.get("sha256") != entry["sha256"]
-        changed = changed or updated
-        trackers[name] = entry
-        print(f"trackers/{name}: {'update' if updated else 'reuse'} {entry['version']}")
-    return trackers, changed
+            print(f"::warning::trackers/{name}: {error}")
+    if entries:
+        content = "\n".join(sorted(entries)) + "\n"
+        body = content.encode("utf-8")
+        entry = {
+            "version": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "fileName": "trackers-merged.txt",
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "size": len(body),
+            "content": content,
+        }
+    else:
+        previous_asset = assets.get(previous.get("fileName", "")) if previous else None
+        if not previous_asset:
+            raise RuntimeError(
+                "all tracker sources failed and no previous merged list is available"
+            )
+        entry = {
+            key: previous[key] for key in ("version", "fileName", "sha256", "size")
+        }
+        entry["previousUrl"] = previous_asset["browser_download_url"]
+    changed = previous is None or previous.get("sha256") != entry["sha256"]
+    print(f"trackers/merged: {'update' if changed else 'reuse'} {entry['version']}")
+    return {"merged": entry}, changed
 
 
 def create_plan(repository: str, output: Path, force: bool) -> dict:
@@ -905,7 +897,7 @@ def assemble_manifest(directory: Path, plan: dict) -> dict:
             "sha256": item["sha256"],
             "size": item["size"],
         }
-    if set(trackers) != set(TRACKER_LISTS):
+    if set(trackers) != {"merged"}:
         raise RuntimeError("incomplete tracker list set in the sync plan")
     manifest = {
         "schemaVersion": 1,
