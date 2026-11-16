@@ -96,7 +96,7 @@ The publisher generates this file; do not upload a hand-edited template. This ab
 - `sha256` is the full lowercase hexadecimal SHA-256 of the final ZIP; `size` is its byte count.
 - `executables` maps tool identifiers to actual relative paths inside that ZIP, using `/` separators. Do not assume every binary is at the ZIP root.
 - `upstreamFingerprint` and `upstream` are publisher bookkeeping/provenance; Toolbox can ignore them.
-- `trackers` maps list identifiers (`xiu2`, `ngosang`) to a plain-text asset next to the manifest. `version` is the UTC fetch date, not an upstream release; `sha256`/`size` cover the exact asset bytes, and clients must verify them. The lists refresh with the daily sync; Toolbox treats the mirror as the primary source and falls back to the upstream raw URLs for live freshness.
+- `trackers` maps list identifiers (`xiu2`, `ngosang`) to a plain-text asset next to the manifest. `version` is the UTC fetch date, not an upstream release; `sha256`/`size` cover the exact asset bytes, and clients must verify them. The lists refresh with the daily sync; Toolbox fetches these lists only through the self-hosted CDN and falls back to its local cache if the CDN is unavailable.
 - `generatedAt` is informational UTC time, not an update/expiry gate. Clients compare their installed ZIP identity/hash to the selected latest package, including packaging-only fixes.
 
 ZIP timestamps are fixed to the ZIP format's 1980 epoch to avoid timestamp-only content changes. Mac executable permissions are retained/restored.
