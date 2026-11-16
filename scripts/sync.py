@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.error
 import urllib.parse
@@ -26,8 +27,13 @@ API_HEADERS = {
     "X-GitHub-Api-Version": "2022-11-28",
 }
 PLATFORMS = ("windows-x64", "macos-arm64")
-TOOLS = ("deno", "mediainfo", "ffmpeg", "bbdown", "yt-dlp")
+TOOLS = ("deno", "mediainfo", "ffmpeg", "bbdown", "yt-dlp", "aria2")
 PACKAGING_REVISION = 1
+# 公共 BT tracker 列表随每日同步进 Release（aria2 页的镜像通道数据源）
+TRACKER_LISTS = {
+    "xiu2": "https://raw.githubusercontent.com/XIU2/TrackersListCollection/master/best.txt",
+    "ngosang": "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
+}
 
 
 def get(url: str, *, github: bool = False) -> bytes:
@@ -301,6 +307,121 @@ def build_ytdlp(platform: str, work: Path, out: Path, upstream: dict) -> dict:
     }
 
 
+def build_aria2_windows(work: Path, out: Path, upstream: dict) -> dict:
+    url, version = upstream["url"], upstream["version"]
+    downloaded = work / "aria2-source.zip"
+    download(url, downloaded, upstream.get("sha256"))
+    extracted = work / "aria2-extracted"
+    extracted.mkdir()
+    extract_zip(downloaded, extracted)
+    executable = find_executable(extracted, "aria2c.exe")
+    package = work / "aria2"
+    package.mkdir()
+    shutil.copy2(executable, package / "aria2c.exe")
+    licenses = [path for path in extracted.rglob("LICENSE*") if path.is_file()]
+    for license_file in licenses:
+        shutil.copy2(license_file, package / license_file.name)
+    if not licenses:
+        try:
+            (package / "LICENSE").write_bytes(get(upstream["licenseUrl"]))
+        except RuntimeError as error:
+            print(f"::warning::{error}")
+    (package / "UPSTREAM.txt").write_text(
+        f"Source: {url}\nRelease: {version}\nBuild: official win-64bit build\n",
+        encoding="utf-8",
+    )
+    target = out / package_filename("aria2", "windows-x64", upstream)
+    zip_dir(package, target)
+    return {
+        "tool": "aria2",
+        "platform": "windows-x64",
+        "upstream_version": version,
+        "source": url,
+        "file": target.name,
+        "size": target.stat().st_size,
+        "sha256": sha256(target),
+        "executables": {"aria2": "aria2c.exe"},
+    }
+
+
+def build_aria2_macos(work: Path, out: Path, upstream: dict) -> dict:
+    # aria2 publishes no official macOS binary; compile the GPG-signed source
+    # tarball instead. AppleTLS is auto-selected on macOS, so no TLS library
+    # is required on the runner.
+    url, version = upstream["url"], upstream["version"]
+    downloaded = work / "aria2-source.tar.gz"
+    download(url, downloaded, upstream.get("sha256"))
+    extracted = work / "aria2-extracted"
+    extracted.mkdir()
+    with tarfile.open(downloaded) as archive:
+        archive.extractall(extracted, filter="data")
+    configure = [path for path in extracted.rglob("configure") if path.is_file()]
+    if len(configure) != 1:
+        raise RuntimeError("official aria2 source tree not found in the tarball")
+    source_root = configure[0].parent
+    build = work / "aria2-build"
+    build.mkdir()
+    subprocess.run(
+        [
+            str(configure[0]),
+            "--disable-nls",
+            "--without-openssl",
+            "--without-gnutls",
+            "--without-libxml2",
+            "--without-libssh2",
+            "--without-sqlite3",
+        ],
+        cwd=build,
+        check=True,
+    )
+    subprocess.run(
+        ["make", "-j", str(os.cpu_count() or 2)],
+        cwd=build,
+        check=True,
+    )
+    binaries = [path for path in build.rglob("aria2c") if path.is_file()]
+    if len(binaries) != 1:
+        raise RuntimeError("expected exactly one aria2c binary in the build tree")
+    binary = binaries[0]
+    kind = subprocess.run(
+        ["file", "-b", str(binary)], check=True, capture_output=True, text=True
+    ).stdout
+    if "arm64" not in kind:
+        raise RuntimeError(f"built aria2c is not an arm64 binary: {kind.strip()}")
+    # 只拷贝 aria2c 单文件进包：产物不得动态链接 Homebrew 等非系统库，
+    # 否则目标机器（无 Homebrew）上无法独立运行
+    linked = subprocess.run(
+        ["otool", "-L", str(binary)], check=True, capture_output=True, text=True
+    ).stdout
+    if "/opt/homebrew" in linked or "/usr/local" in linked:
+        raise RuntimeError(f"aria2c links against non-system libraries:\n{linked}")
+    package = work / "aria2"
+    package.mkdir()
+    shutil.copy2(binary, package / "aria2c")
+    (package / "aria2c").chmod(0o755)
+    copying = source_root / "COPYING"
+    if copying.is_file():
+        shutil.copy2(copying, package / "LICENSE")
+    (package / "UPSTREAM.txt").write_text(
+        f"Source: {url}\nRelease: {version}\n"
+        "Build: compiled from official source, AppleTLS, macOS arm64\n",
+        encoding="utf-8",
+    )
+    target = out / package_filename("aria2", "macos-arm64", upstream)
+    zip_dir(package, target)
+    return {
+        "tool": "aria2",
+        "platform": "macos-arm64",
+        "upstream_version": version,
+        "source": url,
+        "build_variant": "official source, AppleTLS",
+        "file": target.name,
+        "size": target.stat().st_size,
+        "sha256": sha256(target),
+        "executables": {"aria2": "aria2c"},
+    }
+
+
 def build_ffmpeg_windows(work: Path, out: Path, upstream: dict) -> dict:
     version, archive_url = upstream["version"], upstream["url"]
     archive = work / "ffmpeg-source.7z"
@@ -403,9 +524,11 @@ def resolve_upstream(tool: str, platform: str, releases: dict) -> dict:
             releases[repo] = release(repo)
         info = releases[repo]
         names = {
-            "deno": "deno-x86_64-pc-windows-msvc.zip"
-            if platform == "windows-x64"
-            else "deno-aarch64-apple-darwin.zip",
+            "deno": (
+                "deno-x86_64-pc-windows-msvc.zip"
+                if platform == "windows-x64"
+                else "deno-aarch64-apple-darwin.zip"
+            ),
             "bbdown": "_win-x64.zip" if platform == "windows-x64" else "_osx-arm64.zip",
             "yt-dlp": "yt-dlp.exe" if platform == "windows-x64" else "yt-dlp_macos",
         }
@@ -433,6 +556,35 @@ def resolve_upstream(tool: str, platform: str, releases: dict) -> dict:
             source["licenseUrl"] = (
                 f"https://raw.githubusercontent.com/{repo}/{info['tag_name']}/LICENSE"
             )
+        return source
+    if tool == "aria2":
+        repo = "aria2/aria2"
+        if repo not in releases:
+            releases[repo] = release(repo)
+        info = releases[repo]
+        version = info["tag_name"].removeprefix("release-")
+        if version == info["tag_name"]:
+            raise RuntimeError(
+                "aria2 release tag does not follow the release-<version> scheme"
+            )
+        name = (
+            f"aria2-{version}-win-64bit-build1.zip"
+            if platform == "windows-x64"
+            else f"aria2-{version}.tar.gz"
+        )
+        selected = asset(info, name)
+        source = {
+            "version": version,
+            "url": selected["browser_download_url"],
+            "assetId": selected["id"],
+            "updatedAt": selected.get("updated_at"),
+        }
+        digest = selected.get("digest") or ""
+        if digest.startswith("sha256:"):
+            source["sha256"] = digest.removeprefix("sha256:")
+        source["licenseUrl"] = (
+            f"https://raw.githubusercontent.com/{repo}/{info['tag_name']}/COPYING"
+        )
         return source
     if tool == "mediainfo":
         url, version = mediainfo_url(platform)
@@ -512,6 +664,63 @@ def write_json(path: Path, content: dict) -> None:
     )
 
 
+def announce_lines(text: str) -> list[str]:
+    """Count lines that look like announce URLs (the schemes aria2 accepts)."""
+    prefixes = ("udp://", "http://", "https://", "ws://", "wss://")
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and line.strip().lower().startswith(prefixes)
+    ]
+
+
+def resolve_trackers(old_manifest: dict, assets: dict) -> tuple[dict, bool]:
+    """Fetch the public tracker lists so each Release ships fresh mirror copies.
+
+    Mirrors the tools' resilience pattern: on upstream failure keep the previous
+    Release's list (downloaded again at manifest stage); changed digests flip the
+    global ``changed`` flag so tracker-only updates still trigger a Release.
+    """
+    old = old_manifest.get("trackers", {})
+    trackers: dict = {}
+    changed = False
+    for name, url in TRACKER_LISTS.items():
+        previous = old.get(name)
+        try:
+            content = get_text(url)
+            entries = announce_lines(content)
+            if len(entries) < 5:
+                # 语义校验：非 announce 内容（如误吐的 HTML 错误页）走 previous 保留路径，
+                # SHA-256 只能证明传输完整，证明不了内容正确
+                raise RuntimeError(
+                    f"suspicious tracker list: only {len(entries)} announce URLs"
+                )
+            body = content.encode("utf-8")
+            entry = {
+                "version": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "fileName": f"trackers-{name}.txt",
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "size": len(body),
+                "content": content,
+            }
+        except RuntimeError as error:
+            if not previous:
+                raise
+            previous_asset = assets.get(previous.get("fileName", ""))
+            if not previous_asset:
+                raise
+            print(f"::warning::trackers/{name}: {error}; preserving the previous list")
+            entry = {
+                key: previous[key] for key in ("version", "fileName", "sha256", "size")
+            }
+            entry["previousUrl"] = previous_asset["browser_download_url"]
+        updated = previous is None or previous.get("sha256") != entry["sha256"]
+        changed = changed or updated
+        trackers[name] = entry
+        print(f"trackers/{name}: {'update' if updated else 'reuse'} {entry['version']}")
+    return trackers, changed
+
+
 def create_plan(repository: str, output: Path, force: bool) -> dict:
     try:
         previous = release(repository)
@@ -532,11 +741,13 @@ def create_plan(repository: str, output: Path, force: bool) -> dict:
     )
     releases = {}
     platforms = {}
-    changed = False
+    changed = bool(old_manifest.get("aria2"))
     for platform in PLATFORMS:
         packages = {}
         for tool in TOOLS:
             old = old_manifest.get("platforms", {}).get(platform, {}).get(tool)
+            if tool == "aria2" and old is None:
+                old = old_manifest.get("aria2", {}).get(platform)
             old_asset = assets.get(old.get("fileName")) if old else None
             try:
                 upstream = resolve_upstream(tool, platform, releases)
@@ -564,7 +775,14 @@ def create_plan(repository: str, output: Path, force: bool) -> dict:
                 f"{platform}/{tool}: {'build' if needs_build else 'reuse'} {upstream['version']}"
             )
         platforms[platform] = packages
-    plan = {"changed": changed, "repository": repository, "platforms": platforms}
+    trackers, trackers_changed = resolve_trackers(old_manifest, assets)
+    changed = changed or trackers_changed
+    plan = {
+        "changed": changed,
+        "repository": repository,
+        "platforms": platforms,
+        "trackers": trackers,
+    }
     write_json(output, plan)
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
@@ -576,9 +794,7 @@ def build_platform(platform: str, plan: dict, out: Path) -> None:
     actual = (
         "windows-x64"
         if sys.platform == "win32"
-        else "macos-arm64"
-        if sys.platform == "darwin"
-        else ""
+        else "macos-arm64" if sys.platform == "darwin" else ""
     )
     if actual != platform:
         raise RuntimeError(f"requested {platform}, runner is {actual or sys.platform}")
@@ -602,6 +818,12 @@ def build_platform(platform: str, plan: dict, out: Path) -> None:
                     record = build_mediainfo(platform, work, out, upstream)
                 elif tool == "yt-dlp":
                     record = build_ytdlp(platform, work, out, upstream)
+                elif tool == "aria2":
+                    record = (
+                        build_aria2_windows(work, out, upstream)
+                        if platform == "windows-x64"
+                        else build_aria2_macos(work, out, upstream)
+                    )
                 elif platform == "windows-x64":
                     record = build_ffmpeg_windows(work, out, upstream)
                 else:
@@ -629,7 +851,7 @@ def build_platform(platform: str, plan: dict, out: Path) -> None:
     )
 
 
-def assemble_manifest(directory: Path) -> dict:
+def assemble_manifest(directory: Path, plan: dict) -> dict:
     platforms = {}
     expected_files = set()
     for platform in PLATFORMS:
@@ -662,12 +884,33 @@ def assemble_manifest(directory: Path) -> dict:
         platforms[platform] = packages
     if {path.name for path in directory.glob("*.zip")} != expected_files:
         raise RuntimeError(
-            "release directory does not contain exactly the current ten ZIPs"
+            "release directory does not contain exactly the current twelve ZIPs"
         )
+    trackers = {}
+    for name, item in plan.get("trackers", {}).items():
+        filename = item["fileName"]
+        if Path(filename).name != filename or not filename.startswith("trackers-"):
+            raise RuntimeError(f"invalid tracker filename: {filename}")
+        path = directory / filename
+        if "content" in item:
+            path.write_text(item["content"], encoding="utf-8", newline="\n")
+        else:
+            download(item["previousUrl"], path, item["sha256"])
+        if path.stat().st_size != item["size"] or sha256(path) != item["sha256"]:
+            raise RuntimeError(f"invalid final tracker list: {filename}")
+        trackers[name] = {
+            "version": item["version"],
+            "fileName": path.name,
+            "sha256": item["sha256"],
+            "size": item["size"],
+        }
+    if set(trackers) != set(TRACKER_LISTS):
+        raise RuntimeError("incomplete tracker list set in the sync plan")
     manifest = {
         "schemaVersion": 1,
         "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "platforms": platforms,
+        "trackers": trackers,
     }
     write_json(directory / "version.json", manifest)
     return manifest
@@ -689,6 +932,7 @@ def main() -> None:
     build_command.add_argument("--out", default="dist")
     manifest_command = commands.add_parser("manifest")
     manifest_command.add_argument("--directory", default="dist")
+    manifest_command.add_argument("--plan", default="plan.json")
     args = parser.parse_args()
     if args.command == "plan":
         create_plan(args.repository, Path(args.out), args.force)
@@ -699,7 +943,10 @@ def main() -> None:
             Path(args.out).resolve(),
         )
     else:
-        assemble_manifest(Path(args.directory).resolve())
+        assemble_manifest(
+            Path(args.directory).resolve(),
+            json.loads(Path(args.plan).read_text(encoding="utf-8")),
+        )
 
 
 if __name__ == "__main__":

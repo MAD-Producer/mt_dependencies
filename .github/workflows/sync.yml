@@ -98,15 +98,18 @@ jobs:
           pattern: packages-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: sync-plan
       - name: Assemble the complete dependency manifest
-        run: python scripts/sync.py manifest --directory dist
+        run: python scripts/sync.py manifest --directory dist --plan plan.json
       - name: Publish only after all assets are uploaded
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="deps-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          release_id=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" -f name="Dependency snapshot $tag" -f body='Latest dependency ZIPs for Windows x64 and macOS arm64. See version.json for per-tool versions and SHA-256 checksums.' -F draft=true --jq '.id')
-          gh release upload "$tag" dist/*.zip dist/version.json
+          release_id=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" -f name="Dependency snapshot $tag" -f body='Latest dependency ZIPs for Windows x64 and macOS arm64, plus the daily-refreshed public BT tracker lists. See version.json for per-tool versions and SHA-256 checksums.' -F draft=true --jq '.id')
+          gh release upload "$tag" dist/*.zip dist/version.json dist/trackers-*.txt
           gh api "repos/${GITHUB_REPOSITORY}/releases/$release_id" > uploaded-release.json
           python - <<'PY'
           import json
@@ -114,6 +117,8 @@ jobs:
           uploaded = json.loads(Path('uploaded-release.json').read_text())
           expected = {path.name: path.stat().st_size for path in Path('dist').glob('*.zip')}
           expected['version.json'] = Path('dist/version.json').stat().st_size
+          for path in Path('dist').glob('trackers-*.txt'):
+              expected[path.name] = path.stat().st_size
           actual = {asset['name']: asset['size'] for asset in uploaded['assets']}
           if actual != expected:
               raise SystemExit('Release upload is incomplete; leaving it as a draft.')
